@@ -1,116 +1,152 @@
 using System;
-using System.Collections.Generic;
-using System.Globalization;
+using System.Collections.Immutable;
 using System.Linq;
 using System.Linq.Expressions;
-using System.Text;
 
 namespace ObjectPrinting
 {
     public class PrintingConfig<TOwner>
     {
-        public PrintingConfig<TOwner> ExcludeType<TExcludedType>()
+        public PrintingConfig()
         {
-            return this;
+            excludedTypes = ImmutableHashSet<Type>.Empty;
+            excludedFields = ImmutableHashSet<string>.Empty;
+            typeToSerializer = ImmutableDictionary<Type, Func<object, string>>.Empty;
+            propertyNameToSerializer = ImmutableDictionary<string, Func<object, string>>.Empty;
         }
-
-        private Dictionary<Type, Func<object, string>> typeToSerializers;
-        private Dictionary<string, Func<object, string>> propertyNameToSerializer;
         
-        public string PrintToString(TOwner obj)
+        private PrintingConfig(
+            ImmutableHashSet<Type> excludedTypes,
+            ImmutableHashSet<string> excludedFields,
+            ImmutableDictionary<Type, Func<object, string>> typeToSerializer,
+            ImmutableDictionary<string, Func<object, string>> propertyNameToSerializer)
         {
-            return PrintToString(obj, 0);
+            this.excludedTypes = excludedTypes;
+            this.excludedFields = excludedFields;
+            this.typeToSerializer = typeToSerializer;
+            this.propertyNameToSerializer = propertyNameToSerializer;
         }
 
-        private string PrintToString(object obj, int nestingLevel, String properyName = null)
+        private ImmutableHashSet<Type> excludedTypes;
+        private ImmutableHashSet<string> excludedFields;
+        private ImmutableDictionary<Type, Func<object, string>> typeToSerializer;
+        private ImmutableDictionary<string, Func<object, string>> propertyNameToSerializer;
+
+        public string PrintToString(TOwner obj)
+            => PrintToString(obj, 0);
+
+        private string PrintToString(object obj, int nestingLevel, string properyName = null)
         {
-            //TODO apply configurations
             if (obj == null)
-                return "null" + Environment.NewLine;
+                return "null" + Ln();
 
             if (properyName != null && propertyNameToSerializer.ContainsKey(properyName))
-                return propertyNameToSerializer[properyName](obj);
-            if (typeToSerializers.ContainsKey(obj.GetType()))
-                return typeToSerializers[obj.GetType()](obj);
-            
+                return propertyNameToSerializer[properyName](obj) + Ln();
+
+            if (typeToSerializer.ContainsKey(obj.GetType()))
+                return typeToSerializer[obj.GetType()](obj) + Ln();
+
             var finalTypes = new[]
             {
                 typeof(int), typeof(double), typeof(float), typeof(string),
                 typeof(DateTime), typeof(TimeSpan)
             };
+
             if (finalTypes.Contains(obj.GetType()))
-                return obj + Environment.NewLine;
+                return obj + Ln();
 
             var identation = new string('\t', nestingLevel + 1);
-            var sb = new StringBuilder();
             var type = obj.GetType();
-            sb.AppendLine(type.Name);
-            foreach (var propertyInfo in type.GetProperties())
-            {
-                sb.Append(identation + propertyInfo.Name + " = " +
-                          PrintToString(propertyInfo.GetValue(obj),
-                              nestingLevel + 1));
-            }
-            return sb.ToString();
+            var propertiesPrinted = type.GetProperties()
+                .Where(x => !excludedTypes.Contains(x.PropertyType))
+                .Where(x => !excludedFields.Contains(GetName(properyName, x.Name)))
+                .Select(propertyInfo =>
+                    identation + propertyInfo.Name + " = " +
+                    PrintToString(
+                        propertyInfo.GetValue(obj),
+                        nestingLevel + 1,
+                        GetName(properyName, propertyInfo.Name)));
+
+            return type.Name + Ln() + string.Join("", propertiesPrinted);
         }
+
+        private static string GetName(string parent, string child)
+        {
+            return (parent != null ? parent + "." : "") + child;
+        }
+
+        private static string Ln() => Environment.NewLine;
 
         public TypePrintingConfig<T, TOwner> ConfigureType<T>()
         {
-            return new TypePrintingConfig<T, TOwner>(this);
+            return new TypePrintingConfig<T, TOwner>(typeSerializer => WithTypeToSerializer(
+                typeToSerializer
+                    .Remove(typeof(T))
+                    .Add(typeof(T), typeSerializer)));
         }
 
         public TypePrintingConfig<T, TOwner> ConfigureProperty<T>(Expression<Func<TOwner, T>> selector)
         {
-            return new TypePrintingConfig<T, TOwner>(this);
+            var member = selector.Body as MemberExpression;
+            if (member == null) throw new ArgumentException("selector should be MemberExpression"); 
+            return new TypePrintingConfig<T, TOwner>(typeSerializer => WithPropertyNameToSerializer(
+                propertyNameToSerializer
+                    .Remove(member.Member.Name)
+                    .Add(member.Member.Name, typeSerializer)));
+        }
+
+        public PrintingConfig<TOwner> ExcludeType<TExcludedType>()
+        {
+            return WithExcludedTypes(excludedTypes.Add(typeof(TExcludedType)));
         }
 
         public PrintingConfig<TOwner> ExcludeProperty<TProperty>(Expression<Func<TOwner, TProperty>> selector)
         {
-            return this;
-        }
-    }
-
-    public class TypePrintingConfig<TType, TOwner> : ITypePrintingConfig<TType, TOwner>
-    {
-        private readonly PrintingConfig<TOwner> context;
-
-        public TypePrintingConfig(PrintingConfig<TOwner> context)
-        {
-            this.context = context;
+            var member = selector.Body as MemberExpression;
+            if (member == null) throw new ArgumentException("selector should be MemberExpression"); 
+            return WithExcludedFields(excludedFields.Add(member.Member.Name));
         }
 
-        public PrintingConfig<TOwner> SetSerializer(Func<PrintingConfig<TType>, string> func)
+        private PrintingConfig<TOwner> WithExcludedTypes(ImmutableHashSet<Type> excludedTypes)
         {
-            return context;
+            return new PrintingConfig<TOwner>(
+                excludedTypes,
+                excludedFields,
+                typeToSerializer,
+                propertyNameToSerializer
+            );
         }
 
-        PrintingConfig<TOwner> ITypePrintingConfig<TType, TOwner>.ParentConfig 
-            => context;
-    }
+        private PrintingConfig<TOwner> WithExcludedFields(ImmutableHashSet<string> excludedFields)
+        {
+            return new PrintingConfig<TOwner>(
+                excludedTypes,
+                excludedFields,
+                typeToSerializer,
+                propertyNameToSerializer
+            );
+        }
 
-    public interface ITypePrintingConfig<TType, TOwner>
-    {
-        PrintingConfig<TOwner> ParentConfig { get; }
-    }
+        private PrintingConfig<TOwner> WithTypeToSerializer(
+            ImmutableDictionary<Type, Func<object, string>> typeToSerializer)
+        {
+            return new PrintingConfig<TOwner>(
+                excludedTypes,
+                excludedFields,
+                typeToSerializer,
+                propertyNameToSerializer
+            );
+        }
 
-    public static class TypePrintingExtensions
-    {
-        public static PrintingConfig<TOwner> SetCulture<TOwner>(this ITypePrintingConfig<int, TOwner> config, CultureInfo cultureInfo)
+        private PrintingConfig<TOwner> WithPropertyNameToSerializer(
+            ImmutableDictionary<string, Func<object, string>> propertyNameToSerializer)
         {
-            return config.ParentConfig;
-        }
-        public static PrintingConfig<TOwner> SetCulture<TOwner>(this ITypePrintingConfig<long, TOwner> config, CultureInfo cultureInfo)
-        {
-            return config.ParentConfig;
-        }
-        public static PrintingConfig<TOwner> SetCulture<TOwner>(this ITypePrintingConfig<double, TOwner> config, CultureInfo cultureInfo)
-        {
-            return config.ParentConfig;
-        }
-        
-        public static PrintingConfig<TOwner> ShrinkToLength<TOwner>(this ITypePrintingConfig<string, TOwner> config, int length)
-        {
-            return config.ParentConfig;
+            return new PrintingConfig<TOwner>(
+                excludedTypes,
+                excludedFields,
+                typeToSerializer,
+                propertyNameToSerializer
+            );
         }
     }
 
@@ -120,6 +156,6 @@ namespace ObjectPrinting
             => ObjectPrinter.For<T>().PrintToString(obj);
 
         public static string PrintToString<T>(this T obj, Func<PrintingConfig<T>, PrintingConfig<T>> configurer)
-           => configurer(ObjectPrinter.For<T>()).PrintToString(obj);
+            => configurer(ObjectPrinter.For<T>()).PrintToString(obj);
     }
 }
